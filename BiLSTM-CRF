@@ -1,0 +1,380 @@
+import os
+import json
+import random
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from torchcrf import CRF
+from tqdm import tqdm
+from datetime import datetime
+from collections import Counter
+import matplotlib.pyplot as plt
+import matplotlib
+from transformers import get_linear_schedule_with_warmup
+
+# 设置中文字体
+matplotlib.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']
+matplotlib.rcParams['axes.unicode_minus'] = False
+
+# ==================== 配置 ====================
+class Config:
+    # 数据路径
+    train_path = r"D:\初稿\5dc1c-main\ccks数据集\划分后数据\训练集_622.json"
+    dev_path   = r"D:\初稿\5dc1c-main\ccks数据集\划分后数据\验证集_622.json"
+    test_path  = r"D:\初稿\5dc1c-main\ccks数据集\划分后数据\测试集_622.json"
+
+    target_entity_type = "疾病和诊断"
+
+    # BiLSTM-CRF 特有结构
+    char_embed_dim = 64
+    hidden_dim = 128
+    num_layers = 1
+
+    # 统一超参数（与 MacBERT 一致）
+    max_len = 256
+    batch_size = 32
+    epochs = 15
+    lr = 1e-5
+    weight_decay = 0.01
+    dropout = 0.3
+    patience = 4
+    target_f1 = 1.0
+    warmup_ratio = 0.2
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    save_path = "bilstm_crf_lowcap.pth"
+    log_file = "bilstm_crf_log_lowcap.txt"
+    debug = True
+
+config = Config()
+
+# ==================== 固定随机种子 ====================
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+set_seed()
+
+# ==================== 构建字符词表 ====================
+def build_vocab(train_data, min_freq=2):
+    char_counter = Counter()
+    for item in train_data:
+        text = item["text"]
+        for ch in text:
+            char_counter[ch] += 1
+    vocab_chars = [ch for ch, cnt in char_counter.items() if cnt >= min_freq]
+    special_tokens = ["<PAD>", "<UNK>"]
+    vocab = special_tokens + sorted(vocab_chars)
+    char2id = {ch: i for i, ch in enumerate(vocab)}
+    id2char = {i: ch for ch, i in char2id.items()}
+    return char2id, id2char, len(vocab)
+
+# ==================== 数据加载与 BIO 转换 ====================
+def load_json(path):
+    with open(path, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+def convert_entities_to_bio(text, entities, char2id, max_len):
+    target_entities = [e for e in entities if e.get("type") == config.target_entity_type]
+    seq_len = min(len(text), max_len - 2)
+    char_ids = [char2id.get(ch, char2id["<UNK>"]) for ch in text[:seq_len]]
+    labels = ["O"] * len(char_ids)
+    for ent in target_entities:
+        start_char = ent.get("start_idx", ent.get("start"))
+        end_char = ent.get("end_idx", ent.get("end"))
+        if start_char is None or end_char is None:
+            continue
+        if start_char >= len(char_ids) or end_char >= len(char_ids):
+            continue
+        labels[start_char] = "B-DISEASE"
+        for i in range(start_char + 1, end_char + 1):
+            labels[i] = "I-DISEASE"
+    label2id = {"O": 0, "B-DISEASE": 1, "I-DISEASE": 2}
+    label_ids = [label2id[l] for l in labels]
+    pad_len = max_len - len(char_ids)
+    if pad_len > 0:
+        char_ids += [char2id["<PAD>"]] * pad_len
+        label_ids += [0] * pad_len
+    else:
+        char_ids = char_ids[:max_len]
+        label_ids = label_ids[:max_len]
+    return char_ids, label_ids
+
+class NERDataset(Dataset):
+    def __init__(self, data, char2id, is_train=True):
+        self.data = data
+        self.char2id = char2id
+        self.is_train = is_train
+        if config.debug and is_train:
+            self._debug_print()
+
+    def _debug_print(self):
+        sample = self.data[0]
+        text = sample["text"]
+        entities = sample.get("entities", [])
+        print("\n===== BiLSTM-CRF 调试信息（第一个训练样本）=====")
+        print(f"文本：{text[:100]}...")
+        print(f"实体：{entities}")
+        char_ids, label_ids = convert_entities_to_bio(text, entities, self.char2id, config.max_len)
+        unique_labels = set(label_ids)
+        print(f"生成的标签ID集合：{unique_labels}")
+        if unique_labels == {0}:
+            print("❌ 警告：所有标签均为 O，请检查实体类型或索引！")
+        else:
+            print("✅ 标签生成正常，包含非 O 标签。")
+        print("=============================================\n")
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        item = self.data[idx]
+        text = item["text"]
+        entities = item.get("entities", [])
+        char_ids, label_ids = convert_entities_to_bio(text, entities, self.char2id, config.max_len)
+        return {
+            "char_ids": torch.tensor(char_ids, dtype=torch.long),
+            "labels": torch.tensor(label_ids, dtype=torch.long)
+        }
+
+# ==================== BiLSTM-CRF 模型 ====================
+class BiLSTMCRF(nn.Module):
+    def __init__(self, vocab_size, embed_dim, hidden_dim, num_layers, num_labels, dropout):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+        self.lstm = nn.LSTM(embed_dim, hidden_dim // 2, num_layers=num_layers,
+                            bidirectional=True, batch_first=True, dropout=dropout)
+        self.dropout = nn.Dropout(dropout)
+        self.classifier = nn.Linear(hidden_dim, num_labels)
+        self.crf = CRF(num_labels, batch_first=True)
+
+    def forward(self, char_ids, attention_mask=None, labels=None):
+        emb = self.embedding(char_ids)
+        lstm_out, _ = self.lstm(emb)
+        lstm_out = self.dropout(lstm_out)
+        logits = self.classifier(lstm_out)
+        if labels is not None:
+            mask = char_ids != 0
+            loss = -self.crf(logits, labels, mask=mask, reduction="mean")
+            return loss
+        else:
+            mask = char_ids != 0
+            return self.crf.decode(logits, mask=mask)
+
+# ==================== 实体级别评估（同时返回验证损失） ====================
+def extract_spans_from_bio(labels, label2id):
+    b_id = label2id["B-DISEASE"]
+    i_id = label2id["I-DISEASE"]
+    spans = []
+    batch_size, seq_len = labels.shape
+    for b in range(batch_size):
+        i = 0
+        while i < seq_len:
+            if labels[b, i] == b_id:
+                start = i
+                j = i + 1
+                while j < seq_len and labels[b, j] == i_id:
+                    j += 1
+                end = j - 1
+                spans.append((start, end, "DISEASE"))
+                i = j
+            else:
+                i += 1
+    return spans
+
+def evaluate_entity_level(model, data_loader, device, label2id):
+    model.eval()
+    all_true_spans = []
+    all_pred_spans = []
+    total_loss = 0.0
+    num_batches = 0
+    with torch.no_grad():
+        for batch in tqdm(data_loader, desc="Entity-level evaluation"):
+            char_ids = batch["char_ids"].to(device)
+            labels = batch["labels"].to(device)
+
+            # 计算验证损失
+            loss = model(char_ids, labels=labels)
+            total_loss += loss.item()
+            num_batches += 1
+
+            # 获取预测标签
+            pred_labels = model(char_ids, labels=None)
+            max_len = max(len(seq) for seq in pred_labels)
+            pred_tensor = torch.zeros(len(pred_labels), max_len, dtype=torch.long, device=device)
+            for i, seq in enumerate(pred_labels):
+                pred_tensor[i, :len(seq)] = torch.tensor(seq, device=device)
+
+            true_spans = extract_spans_from_bio(labels, label2id)
+            pred_spans = extract_spans_from_bio(pred_tensor, label2id)
+
+            all_true_spans.extend(true_spans)
+            all_pred_spans.extend(pred_spans)
+
+    avg_val_loss = total_loss / num_batches if num_batches > 0 else 0.0
+
+    true_set = set(all_true_spans)
+    pred_set = set(all_pred_spans)
+    tp = len(true_set & pred_set)
+    fp = len(pred_set - true_set)
+    fn = len(true_set - pred_set)
+    precision = tp / (tp + fp) if (tp+fp) > 0 else 0
+    recall = tp / (tp + fn) if (tp+fn) > 0 else 0
+    f1 = 2 * precision * recall / (precision + recall) if (precision+recall) > 0 else 0
+    return precision, recall, f1, avg_val_loss
+
+# ==================== 训练函数（记录历史，包含验证损失） ====================
+def train(model, train_loader, dev_loader, optimizer, scheduler):
+    best_f1 = 0.0
+    wait = 0
+    train_losses = []
+    val_losses = []
+    val_f1s = []
+
+    with open(config.log_file, "w", encoding="utf-8") as f:
+        f.write(f"BiLSTM-CRF Training started at {datetime.now()}\n")
+        f.write("Epoch,Train Loss,Val Loss,Val Precision,Val Recall,Val F1\n")
+
+    for epoch in range(config.epochs):
+        model.train()
+        total_loss = 0
+        bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config.epochs}")
+        for batch in bar:
+            optimizer.zero_grad()
+            char_ids = batch["char_ids"].to(config.device)
+            labels = batch["labels"].to(config.device)
+            loss = model(char_ids, labels=labels)
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+            total_loss += loss.item()
+            bar.set_postfix(loss=loss.item())
+        avg_loss = total_loss / len(train_loader)
+        train_losses.append(avg_loss)
+
+        precision, recall, f1, avg_val_loss = evaluate_entity_level(
+            model, dev_loader, config.device, {"O":0, "B-DISEASE":1, "I-DISEASE":2}
+        )
+        val_losses.append(avg_val_loss)
+        val_f1s.append(f1)
+
+        print(f"Epoch {epoch+1}: Train Loss={avg_loss:.4f}, Val Loss={avg_val_loss:.4f}, Val F1={f1:.4f} (P={precision:.4f}, R={recall:.4f})")
+        with open(config.log_file, "a", encoding="utf-8") as f:
+            f.write(f"{epoch+1},{avg_loss:.4f},{avg_val_loss:.4f},{precision:.4f},{recall:.4f},{f1:.4f}\n")
+
+        if f1 > best_f1:
+            best_f1 = f1
+            wait = 0
+            torch.save(model.state_dict(), config.save_path)
+            print("✅ 保存最佳模型")
+        else:
+            wait += 1
+            if wait >= config.patience:
+                print(f"早停触发：连续 {config.patience} 轮 F1 未提升")
+                break
+
+    if os.path.exists(config.save_path):
+        model.load_state_dict(torch.load(config.save_path))
+        print("已加载最佳模型")
+    else:
+        print("警告：未找到最佳模型文件，使用当前模型")
+
+    history = {"train_loss": train_losses, "val_loss": val_losses, "val_f1": val_f1s}
+    return model, history
+
+# ==================== 绘图函数（左图：训练+验证损失，右图：验证F1） ====================
+def plot_history(history, save_path="bilstm_crf_training_curves.png"):
+    train_loss = history["train_loss"]
+    val_loss = history["val_loss"]
+    val_f1 = history["val_f1"]
+    epochs = range(1, len(train_loss) + 1)
+
+    plt.figure(figsize=(12, 5))
+
+    # 左图：训练损失 + 验证损失
+    plt.subplot(1, 2, 1)
+    plt.plot(epochs, train_loss, 'b-o', linewidth=2, markersize=6, label='Training Loss')
+    plt.plot(epochs, val_loss, 'g-s', linewidth=2, markersize=6, label='Validation Loss')
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title("BiLSTM-CRF 训练与验证损失变化曲线")
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.6)
+
+    # 右图：验证 F1
+    plt.subplot(1, 2, 2)
+    plt.plot(epochs, val_f1, 'r-s', linewidth=2, markersize=6, label='Validation F1 Score')
+    plt.xlabel("Epoch")
+    plt.ylabel("F1 Score")
+    plt.title("BiLSTM-CRF 验证集F1值变化曲线")
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.6)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.show()
+    print(f"训练曲线图已保存为 {save_path}")
+
+# ==================== 主函数 ====================
+if __name__ == "__main__":
+    train_data = load_json(config.train_path)
+    dev_data = load_json(config.dev_path)
+    test_data = load_json(config.test_path)
+    print(f"训练集：{len(train_data)}，验证集：{len(dev_data)}，测试集：{len(test_data)}")
+
+    char2id, id2char, vocab_size = build_vocab(train_data, min_freq=1)
+    print(f"词表大小：{vocab_size}")
+
+    train_dataset = NERDataset(train_data, char2id, is_train=True)
+    dev_dataset = NERDataset(dev_data, char2id, is_train=False)
+    test_dataset = NERDataset(test_data, char2id, is_train=False)
+
+    train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True)
+    dev_loader = DataLoader(dev_dataset, batch_size=config.batch_size, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=config.batch_size, shuffle=False)
+
+    model = BiLSTMCRF(vocab_size, config.char_embed_dim, config.hidden_dim,
+                      config.num_layers, 3, config.dropout).to(config.device)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
+    total_steps = len(train_loader) * config.epochs
+    scheduler = get_linear_schedule_with_warmup(optimizer,
+                                                num_warmup_steps=int(total_steps * config.warmup_ratio),
+                                                num_training_steps=total_steps)
+
+    print("开始训练 BiLSTM-CRF（超参数已统一）...")
+    model, history = train(model, train_loader, dev_loader, optimizer, scheduler)
+
+    # 绘制双曲线（训练+验证损失，F1）
+    plot_history(history, save_path="bilstm_crf_training_curves.png")
+
+    # 保存历史数据
+    with open("bilstm_crf_training_history.json", "w", encoding="utf-8") as f:
+        json.dump(history, f, indent=2)
+    print("训练历史已保存至 bilstm_crf_training_history.json")
+
+    print("\n===== 最终评估 =====")
+    if os.path.exists(config.save_path):
+        model.load_state_dict(torch.load(config.save_path))
+        print("已加载最佳模型进行评估")
+    else:
+        print("未找到最佳模型，使用当前模型进行评估")
+
+    # 最终评估时忽略返回的验证损失
+    val_precision, val_recall, val_f1, _ = evaluate_entity_level(model, dev_loader, config.device, {"O":0, "B-DISEASE":1, "I-DISEASE":2})
+    test_precision, test_recall, test_f1, _ = evaluate_entity_level(model, test_loader, config.device, {"O":0, "B-DISEASE":1, "I-DISEASE":2})
+
+    print("\n| Dataset   | Precision | Recall | F1     |")
+    print("|-----------|-----------|--------|--------|")
+    print(f"| Validation| {val_precision:.4f}   | {val_recall:.4f} | {val_f1:.4f} |")
+    print(f"| Test      | {test_precision:.4f}   | {test_recall:.4f} | {test_f1:.4f} |")
+
+    with open(config.log_file, "a", encoding="utf-8") as f:
+        f.write(f"\nFinal Validation: Precision={val_precision:.4f}, Recall={val_recall:.4f}, F1={val_f1:.4f}\n")
+        f.write(f"Final Test: Precision={test_precision:.4f}, Recall={test_recall:.4f}, F1={test_f1:.4f}\n")
+
+    print(f"\n训练日志已保存至 {config.log_file}")
+    print("🎉 BiLSTM-CRF 实验完成！")
