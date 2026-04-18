@@ -1,0 +1,335 @@
+import os
+import json
+import random
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from transformers import AutoTokenizer, AutoModel, get_linear_schedule_with_warmup, AutoConfig, BertConfig
+from tqdm import tqdm
+from datetime import datetime
+
+# ==================== 配置（与原 MacBERT 实验完全相同） ====================
+class Config:
+    # 数据路径
+    train_path = r"D:\初稿\5dc1c-main\ccks数据集\划分后数据\训练集_622.json"
+    dev_path   = r"D:\初稿\5dc1c-main\ccks数据集\划分后数据\验证集_622.json"
+    test_path  = r"D:\初稿\5dc1c-main\ccks数据集\划分后数据\测试集_622.json"
+
+    # 模型路径（仅用于加载分词器和配置，不加载预训练权重）
+    model_name_or_path = r"D:\初稿\5dc1c-main\ccks数据集\macbert_model"
+
+    # 超参数（与原实验一致）
+    max_len = 256
+    batch_size = 32
+    epochs = 15
+    lr = 1e-5
+    weight_decay = 0.01
+    warmup_ratio = 0.2
+
+    # 实体类型
+    target_entity_type = "疾病和诊断"
+    if target_entity_type == "疾病和诊断":
+        bio_prefix = "DISEASE"
+    elif target_entity_type == "症状":
+        bio_prefix = "SYMPTOM"
+    else:
+        bio_prefix = target_entity_type.upper()
+    label_list = ["O", f"B-{bio_prefix}", f"I-{bio_prefix}"]
+    num_labels = len(label_list)
+    label2id = {l: i for i, l in enumerate(label_list)}
+    id2label = {i: l for l, i in label2id.items()}
+
+    # 类别权重（与原实验相同）
+    class_weights = [1.0, 1.0, 1.0]
+
+    # 训练技巧
+    dropout = 0.3
+    patience = 4
+    target_f1 = 1.0
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    save_path = "macbert_random_init.pth"   # 不同保存路径
+    log_file = "macbert_random_init_log.txt"
+
+    # 其他开关
+    use_augmentation = False
+    aug_prob = 0.3
+    use_glyph = False
+    use_boundary = False
+    glyph_dim = 64
+    boundary_dim = 8
+    use_global_pointer = False
+
+config = Config()
+
+# ==================== 固定随机种子 ====================
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+set_seed()
+
+# ==================== 数据加载与 BIO 转换（与原实验完全相同） ====================
+def load_json(path):
+    with open(path, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+def simple_augment(text):
+    return text
+
+def convert_entities_to_bio(text, entities, tokenizer, max_len):
+    target_entities = [e for e in entities if e.get("type") == config.target_entity_type]
+    encoding = tokenizer(text, return_offsets_mapping=True, truncation=True, max_length=max_len)
+    offsets = encoding["offset_mapping"]
+    labels = ["O"] * len(encoding["input_ids"])
+
+    for ent in target_entities:
+        start_char = ent.get("start_idx", ent.get("start"))
+        end_char = ent.get("end_idx", ent.get("end"))
+        if start_char is None or end_char is None:
+            continue
+        token_start, token_end = None, None
+        for i, (off_start, off_end) in enumerate(offsets):
+            if off_start == off_end == 0:
+                continue
+            if off_start <= start_char < off_end:
+                token_start = i
+            if off_start <= end_char < off_end:
+                token_end = i
+        if token_start is None or token_end is None:
+            indices = []
+            for i, (off_start, off_end) in enumerate(offsets):
+                if off_start == off_end == 0:
+                    continue
+                if max(start_char, off_start) <= min(end_char, off_end - 1):
+                    indices.append(i)
+            if indices:
+                token_start = min(indices)
+                token_end = max(indices)
+            else:
+                continue
+        labels[token_start] = f"B-{config.bio_prefix}"
+        for i in range(token_start + 1, token_end + 1):
+            labels[i] = f"I-{config.bio_prefix}"
+
+    label_ids = [config.label2id["O"]]   # [CLS]
+    for l in labels:
+        label_ids.append(config.label2id[l])
+    label_ids.append(config.label2id["O"])  # [SEP]
+
+    if len(label_ids) > max_len:
+        label_ids = label_ids[:max_len]
+    else:
+        label_ids += [config.label2id["O"]] * (max_len - len(label_ids))
+    return label_ids
+
+class NERDataset(Dataset):
+    def __init__(self, data, tokenizer, is_train=True):
+        self.data = data
+        self.tokenizer = tokenizer
+        self.is_train = is_train
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        item = self.data[idx]
+        text = item["text"]
+        if self.is_train and config.use_augmentation:
+            text = simple_augment(text)
+        entities = item.get("entities", [])
+        label_ids = convert_entities_to_bio(text, entities, self.tokenizer, config.max_len)
+        encoding = self.tokenizer(text, max_length=config.max_len, padding="max_length", truncation=True, return_tensors="pt")
+        return {
+            "input_ids": encoding["input_ids"].squeeze(),
+            "attention_mask": encoding["attention_mask"].squeeze(),
+            "token_type_ids": encoding["token_type_ids"].squeeze(),
+            "labels": torch.tensor(label_ids, dtype=torch.long)
+        }
+
+# ==================== 模型（随机初始化，无预训练） ====================
+class RandomInitBertModel(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        # 从预训练模型的配置中获取结构参数，但权重随机初始化
+        bert_config = BertConfig.from_pretrained(config.model_name_or_path)
+        # 随机初始化 BERT 模型（不加载预训练权重）
+        self.bert = AutoModel.from_config(bert_config)
+        self.dropout = nn.Dropout(config.dropout)
+        self.classifier = nn.Linear(self.bert.config.hidden_size, config.num_labels)
+
+        # 打印参数量
+        total_params = sum(p.numel() for p in self.parameters())
+        print(f"随机初始化 BERT 模型，总参数量：{total_params:,}")
+
+    def forward(self, input_ids, attention_mask, token_type_ids, labels=None):
+        outputs = self.bert(input_ids, attention_mask, token_type_ids)
+        seq_out = self.dropout(outputs.last_hidden_state)
+        logits = self.classifier(seq_out)
+        if labels is not None:
+            loss_fct = nn.CrossEntropyLoss(weight=torch.tensor(config.class_weights, device=logits.device), ignore_index=-100)
+            active_loss = attention_mask.view(-1) == 1
+            active_logits = logits.view(-1, config.num_labels)[active_loss]
+            active_labels = labels.view(-1)[active_loss]
+            loss = loss_fct(active_logits, active_labels)
+            return loss
+        else:
+            preds = torch.argmax(logits, dim=-1)
+            return preds.cpu().tolist()
+
+# ==================== 实体级别评估（与原实验完全相同） ====================
+def extract_spans_from_bio(labels, label2id, bio_prefix):
+    b_id = label2id.get(f"B-{bio_prefix}", 1)
+    i_id = label2id.get(f"I-{bio_prefix}", 2)
+    spans = []
+    batch_size, seq_len = labels.shape
+    for b in range(batch_size):
+        i = 0
+        while i < seq_len:
+            if labels[b, i] == b_id:
+                start = i
+                j = i + 1
+                while j < seq_len and labels[b, j] == i_id:
+                    j += 1
+                end = j - 1
+                spans.append((start, end, bio_prefix))
+                i = j
+            else:
+                i += 1
+    return spans
+
+def evaluate_entity_level(model, data_loader, device, label2id, bio_prefix):
+    model.eval()
+    all_true_spans = []
+    all_pred_spans = []
+    with torch.no_grad():
+        for batch in tqdm(data_loader, desc="Entity-level evaluation"):
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            token_type_ids = batch["token_type_ids"].to(device)
+            labels = batch["labels"].to(device)
+            pred_labels = model(input_ids, attention_mask, token_type_ids, labels=None)
+            pred_tensor = torch.tensor(pred_labels, device=device)
+            true_spans = extract_spans_from_bio(labels, label2id, bio_prefix)
+            pred_spans = extract_spans_from_bio(pred_tensor, label2id, bio_prefix)
+            all_true_spans.extend(true_spans)
+            all_pred_spans.extend(pred_spans)
+    true_set = set(all_true_spans)
+    pred_set = set(all_pred_spans)
+    tp = len(true_set & pred_set)
+    fp = len(pred_set - true_set)
+    fn = len(true_set - pred_set)
+    precision = tp / (tp + fp) if (tp+fp) > 0 else 0
+    recall = tp / (tp + fn) if (tp+fn) > 0 else 0
+    f1 = 2 * precision * recall / (precision + recall) if (precision+recall) > 0 else 0
+    return precision, recall, f1
+
+# ==================== 训练函数（与原实验完全相同） ====================
+def train(model, train_loader, dev_loader, optimizer, scheduler):
+    best_f1 = 0.0
+    wait = 0
+    with open(config.log_file, "w", encoding="utf-8") as f:
+        f.write(f"Random Init MacBERT Training started at {datetime.now()}\n")
+        f.write("Epoch,Train Loss,Val Precision,Val Recall,Val F1\n")
+
+    for epoch in range(config.epochs):
+        model.train()
+        total_loss = 0
+        bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config.epochs} (Random Init)")
+        for batch in bar:
+            optimizer.zero_grad()
+            loss = model(batch["input_ids"].to(config.device),
+                         batch["attention_mask"].to(config.device),
+                         batch["token_type_ids"].to(config.device),
+                         batch["labels"].to(config.device))
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+            total_loss += loss.item()
+            bar.set_postfix(loss=loss.item())
+        avg_train_loss = total_loss / len(train_loader)
+
+        precision, recall, f1 = evaluate_entity_level(model, dev_loader, config.device, config.label2id, config.bio_prefix)
+        print(f"Epoch {epoch+1}: Train Loss={avg_train_loss:.4f}, Val F1={f1:.4f} (P={precision:.4f}, R={recall:.4f})")
+        with open(config.log_file, "a", encoding="utf-8") as f:
+            f.write(f"{epoch+1},{avg_train_loss:.4f},{precision:.4f},{recall:.4f},{f1:.4f}\n")
+
+        if f1 > best_f1:
+            best_f1 = f1
+            wait = 0
+            torch.save(model.state_dict(), config.save_path)
+            print("✅ 保存最佳模型")
+        else:
+            wait += 1
+            if wait >= config.patience:
+                print(f"早停触发：连续 {config.patience} 轮 F1 未提升")
+                break
+        if f1 >= config.target_f1:
+            print(f"🎉 已达到目标 F1 = {config.target_f1}，提前停止训练")
+            break
+
+    if os.path.exists(config.save_path):
+        model.load_state_dict(torch.load(config.save_path))
+        print("已加载最佳模型")
+    else:
+        print("警告：未找到最佳模型文件，使用当前模型")
+    return model
+
+# ==================== 主函数 ====================
+if __name__ == "__main__":
+    # 加载数据
+    train_data = load_json(config.train_path)
+    dev_data = load_json(config.dev_path)
+    test_data = load_json(config.test_path)
+    print(f"训练集：{len(train_data)}，验证集：{len(dev_data)}，测试集：{len(test_data)}")
+
+    # 加载分词器（仍然使用预训练分词器，因为词表与配置一致）
+    print("正在加载分词器...")
+    tokenizer = AutoTokenizer.from_pretrained(config.model_name_or_path)
+    print("✅ 分词器加载完成")
+
+    # 构建数据集
+    train_dataset = NERDataset(train_data, tokenizer, is_train=True)
+    dev_dataset = NERDataset(dev_data, tokenizer, is_train=False)
+    test_dataset = NERDataset(test_data, tokenizer, is_train=False)
+
+    train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True)
+    dev_loader = DataLoader(dev_dataset, batch_size=config.batch_size, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=config.batch_size, shuffle=False)
+
+    # 初始化随机权重模型
+    print("正在初始化随机权重的 BERT 模型（无预训练）...")
+    model = RandomInitBertModel(config).to(config.device)
+    print(f"✅ 模型初始化完成，设备：{config.device}")
+
+    # 优化器与调度器（与原实验相同）
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
+    total_steps = len(train_loader) * config.epochs
+    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=int(total_steps * config.warmup_ratio), num_training_steps=total_steps)
+
+    # 训练
+    print("开始训练随机初始化 MacBERT 模型（消融实验：无预训练）...")
+    model = train(model, train_loader, dev_loader, optimizer, scheduler)
+
+    # 最终评估
+    print("\n===== 最终评估 =====")
+    if os.path.exists(config.save_path):
+        model.load_state_dict(torch.load(config.save_path))
+        print("已加载最佳模型进行评估")
+
+    val_precision, val_recall, val_f1 = evaluate_entity_level(model, dev_loader, config.device, config.label2id, config.bio_prefix)
+    test_precision, test_recall, test_f1 = evaluate_entity_level(model, test_loader, config.device, config.label2id, config.bio_prefix)
+
+    print("\n| Dataset   | Precision | Recall | F1     |")
+    print("|-----------|-----------|--------|--------|")
+    print(f"| Validation| {val_precision:.4f}   | {val_recall:.4f} | {val_f1:.4f} |")
+    print(f"| Test      | {test_precision:.4f}   | {test_recall:.4f} | {test_f1:.4f} |")
+
+    with open(config.log_file, "a", encoding="utf-8") as f:
+        f.write(f"\nFinal Validation: Precision={val_precision:.4f}, Recall={val_recall:.4f}, F1={val_f1:.4f}\n")
+        f.write(f"Final Test: Precision={test_precision:.4f}, Recall={test_recall:.4f}, F1={test_f1:.4f}\n")
+
+    print(f"\n训练日志已保存至 {config.log_file}")
+    print("🎉 随机初始化 MacBERT 消融实验完成！")
